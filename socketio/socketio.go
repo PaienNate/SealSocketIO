@@ -3,11 +3,11 @@ package socketio
 import (
 	"context"
 	"errors"
-	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	"net/http"
 	"sync"
 	"time"
-	socketws "websocket/socketio/websocket"
 )
 
 // Source @url:https://github.com/gorilla/websocket/blob/master/conn.go#L61
@@ -190,7 +190,7 @@ type Websocket struct {
 	once sync.Once
 	mu   sync.RWMutex
 	// The Fiber.Websocket connection
-	Conn *socketws.Conn
+	Conn *websocket.Conn
 	// Define if the connection is alive or not
 	isAlive bool
 	// Queue of messages sent from the socket
@@ -202,34 +202,20 @@ type Websocket struct {
 	attributes map[string]interface{}
 	// Unique id of the connection
 	UUID string
-	// Wrap Fiber Locals function
-	Locals func(key string) interface{}
-	// Wrap Fiber Params function
-	Params func(key string, defaultValue ...string) string
-	// Wrap Fiber Query function
-	Query func(key string, defaultValue ...string) string
-	// Wrap Fiber Cookies function
-	Cookies func(key string, defaultValue ...string) string
 	// Manager
 	manager *SocketInstance
 }
 
-func (sm *SocketInstance) New(callback func(kws *Websocket), config ...socketws.Config) gin.HandlerFunc {
-	return socketws.New(func(c *socketws.Conn) {
+func fakeNewWrapper(handler func(conn *websocket.Conn), conn *websocket.Conn) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		handler(conn)
+	}
+}
+
+func (sm *SocketInstance) New(callback func(kws *Websocket), conn *websocket.Conn) http.HandlerFunc {
+	tempFunction := func(c *websocket.Conn) {
 		kws := &Websocket{
-			Conn: c,
-			Locals: func(key string) interface{} {
-				return c.Locals(key)
-			},
-			Params: func(key string, defaultValue ...string) string {
-				return c.Params(key, defaultValue...)
-			},
-			Query: func(key string, defaultValue ...string) string {
-				return c.Query(key, defaultValue...)
-			},
-			Cookies: func(key string, defaultValue ...string) string {
-				return c.Cookies(key, defaultValue...)
-			},
+			Conn:       c,
 			queue:      make(chan message, 100),
 			done:       make(chan struct{}, 1),
 			attributes: make(map[string]interface{}),
@@ -250,7 +236,37 @@ func (sm *SocketInstance) New(callback func(kws *Websocket), config ...socketws.
 
 		// Run the loop for the given connection
 		kws.run()
-	}, config...)
+	}
+	return fakeNewWrapper(tempFunction, conn)
+}
+
+// NewClient 只需要我们直接执行对应的function
+func (sm *SocketInstance) NewClient(callback func(kws *Websocket), conn *websocket.Conn) {
+	tempFunction := func(c *websocket.Conn) {
+		kws := &Websocket{
+			Conn:       c,
+			queue:      make(chan message, 100),
+			done:       make(chan struct{}, 1),
+			attributes: make(map[string]interface{}),
+			isAlive:    true,
+			manager:    sm,
+		}
+
+		// Generate uuid
+		kws.UUID = kws.createUUID()
+
+		// register the connection into the pool
+		sm.pool.set(kws)
+
+		// execute the callback of the socket initialization
+		callback(kws)
+
+		kws.fireEvent(EventConnect, nil, nil)
+
+		// Run the loop for the given connection
+		kws.run()
+	}
+	tempFunction(conn)
 }
 
 func (kws *Websocket) GetUUID() string {
@@ -380,7 +396,7 @@ func (kws *Websocket) IsAlive() bool {
 func (kws *Websocket) hasConn() bool {
 	kws.mu.RLock()
 	defer kws.mu.RUnlock()
-	return kws.Conn.Conn != nil
+	return kws.Conn != nil
 }
 
 func (kws *Websocket) setAlive(alive bool) {
