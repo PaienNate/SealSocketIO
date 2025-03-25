@@ -42,22 +42,39 @@ func main() {
 			ep.Kws.Fire(message.Event, []byte(message.Data))
 		}
 	})
+
 	instance.On(socketio.EventConnect, func(ep *socketio.EventPayload) {
 		fmt.Println("连接成功")
 	})
 
-	// 此处缺少一个通过gorilla的websocket客户端连接ws://127.0.0.1:3001的逻辑
-	conn, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:3001/wsB", nil)
+	// 初始连接
+	conn, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:8080/ws", nil)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Println("初始连接失败:", err)
 		return
 	}
-	instance.NewClient(func(kws *socketio.Websocket) {
+
+	instance.On(socketio.EventDisconnect, func(ep *socketio.EventPayload) {
+		fmt.Println("断开连接，尝试重连")
+		conn, _, err = websocket.DefaultDialer.Dial("ws://127.0.0.1:8080/ws", nil)
+		if err != nil {
+			fmt.Println("初始连接失败:", err)
+		}
+		instance.NewClient(func(kws *socketio.WebsocketWrapper) {
+			// 此时的BroadCast无效，因为Broadcast只会发给除了自己以外的客户端，不可能存在这样的客户端
+			kws.Broadcast([]byte(fmt.Sprintf("New user connected:  and UUID: %s", kws.UUID)), true, socketio.TextMessage)
+			// Emit发送消息有效，获取的KWS 的UUID就是刚刚连接的ws的UUID
+			kws.Emit([]byte(fmt.Sprintf("Hello user:  with UUID: %s", kws.UUID)), socketio.TextMessage)
+		}, conn)
+	})
+
+	instance.NewClient(func(kws *socketio.WebsocketWrapper) {
 		// 此时的BroadCast无效，因为Broadcast只会发给除了自己以外的客户端，不可能存在这样的客户端
 		kws.Broadcast([]byte(fmt.Sprintf("New user connected:  and UUID: %s", kws.UUID)), true, socketio.TextMessage)
 		// Emit发送消息有效，获取的KWS 的UUID就是刚刚连接的ws的UUID
 		kws.Emit([]byte(fmt.Sprintf("Hello user:  with UUID: %s", kws.UUID)), socketio.TextMessage)
 	}, conn)
+
 	// 塞个循环别结束掉
 	select {}
 }

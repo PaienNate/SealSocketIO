@@ -63,7 +63,7 @@ var (
 	PongTimeout = 1 * time.Second
 	// RetrySendTimeout retry after 20 ms if there is an error
 	RetrySendTimeout = 20 * time.Millisecond
-	//MaxSendRetry define max retries if there are socket issues
+	// MaxSendRetry define max retries if there are socket issues
 	MaxSendRetry = 5
 	// ReadTimeout Instead of reading in a for loop, try to avoid full CPU load taking some pause
 	ReadTimeout = 10 * time.Millisecond
@@ -79,12 +79,32 @@ type message struct {
 	retries int
 }
 
+type WebsocketWrapper struct {
+	once sync.Once
+	mu   sync.RWMutex
+	// Change to websocket raw
+	Conn *websocket.Conn
+	// Define if the connection is alive or not
+	isAlive bool
+	// Queue of messages sent from the socket
+	queue chan message
+	// Channel to signal when this websocket is closed
+	// so go routines will stop gracefully
+	done chan struct{}
+	// Attributes map collection for the connection
+	attributes map[string]interface{}
+	// Unique id of the connection
+	UUID string
+	// Manager
+	manager *SocketInstance
+}
+
 // EventPayload Event Payload is the object that
 // stores all the information about the event and
 // the connection
 type EventPayload struct {
 	// The connection object
-	Kws *Websocket
+	Kws *WebsocketWrapper
 	// The name of the event
 	Name string
 	// Unique connection UUID
@@ -129,6 +149,8 @@ type ws interface {
 type SocketInstance struct {
 	pool      safePool
 	listeners safeListeners
+	// 判断是否是客户端模式
+	ClientFlag bool
 }
 
 func NewSocketInstance() *SocketInstance {
@@ -141,6 +163,7 @@ func NewSocketInstance() *SocketInstance {
 
 // EmitToList Emit the message to a specific socket uuids list
 // Ignores all errors
+// 在客户端模式下，这个UUID列表实际上只有一个，所以无所谓
 func (sm *SocketInstance) EmitToList(uuids []string, message []byte, mType ...int) {
 	for _, wsUUID := range uuids {
 		_ = sm.EmitTo(wsUUID, message, mType...)
@@ -148,6 +171,7 @@ func (sm *SocketInstance) EmitToList(uuids []string, message []byte, mType ...in
 }
 
 // Broadcast to all the active connections
+// 在客户端模式下，这个UUID列表实际上只有一个，所以做了一点无用功，但性能影响应该不大
 func (sm *SocketInstance) Broadcast(message []byte, mType ...int) {
 	for _, kws := range sm.pool.all() {
 		kws.Emit(message, mType...)
@@ -175,6 +199,7 @@ func (sm *SocketInstance) Fire(event string, data []byte) {
 }
 
 // Fires event on all connections.
+// 在客户端模式下，这个UUID列表实际上只有一个，所以做了一点无用功，但性能影响应该不大
 func (sm *SocketInstance) fireGlobalEvent(event string, data []byte, error error) {
 	for _, kws := range sm.pool.all() {
 		kws.fireEvent(event, data, error)
@@ -186,35 +211,15 @@ func (sm *SocketInstance) On(event string, callback eventCallback) {
 	sm.listeners.set(event, callback)
 }
 
-type Websocket struct {
-	once sync.Once
-	mu   sync.RWMutex
-	// The Fiber.Websocket connection
-	Conn *websocket.Conn
-	// Define if the connection is alive or not
-	isAlive bool
-	// Queue of messages sent from the socket
-	queue chan message
-	// Channel to signal when this websocket is closed
-	// so go routines will stop gracefully
-	done chan struct{}
-	// Attributes map collection for the connection
-	attributes map[string]interface{}
-	// Unique id of the connection
-	UUID string
-	// Manager
-	manager *SocketInstance
-}
-
 func fakeNewWrapper(handler func(conn *websocket.Conn), conn *websocket.Conn) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		handler(conn)
 	}
 }
 
-func (sm *SocketInstance) New(callback func(kws *Websocket), conn *websocket.Conn) http.HandlerFunc {
+func (sm *SocketInstance) New(callback func(kws *WebsocketWrapper), conn *websocket.Conn) http.HandlerFunc {
 	tempFunction := func(c *websocket.Conn) {
-		kws := &Websocket{
+		kws := &WebsocketWrapper{
 			Conn:       c,
 			queue:      make(chan message, 100),
 			done:       make(chan struct{}, 1),
@@ -241,9 +246,9 @@ func (sm *SocketInstance) New(callback func(kws *Websocket), conn *websocket.Con
 }
 
 // NewClient 只需要我们直接执行对应的function
-func (sm *SocketInstance) NewClient(callback func(kws *Websocket), conn *websocket.Conn) {
+func (sm *SocketInstance) NewClient(callback func(kws *WebsocketWrapper), conn *websocket.Conn) {
 	tempFunction := func(c *websocket.Conn) {
-		kws := &Websocket{
+		kws := &WebsocketWrapper{
 			Conn:       c,
 			queue:      make(chan message, 100),
 			done:       make(chan struct{}, 1),
@@ -266,16 +271,17 @@ func (sm *SocketInstance) NewClient(callback func(kws *Websocket), conn *websock
 		// Run the loop for the given connection
 		kws.run()
 	}
+	sm.ClientFlag = true
 	tempFunction(conn)
 }
 
-func (kws *Websocket) GetUUID() string {
+func (kws *WebsocketWrapper) GetUUID() string {
 	kws.mu.RLock()
 	defer kws.mu.RUnlock()
 	return kws.UUID
 }
 
-func (kws *Websocket) SetUUID(uuid string) error {
+func (kws *WebsocketWrapper) SetUUID(uuid string) error {
 	kws.mu.Lock()
 	defer kws.mu.Unlock()
 
@@ -287,14 +293,14 @@ func (kws *Websocket) SetUUID(uuid string) error {
 }
 
 // SetAttribute Set a specific attribute for the specific socket connection
-func (kws *Websocket) SetAttribute(key string, attribute interface{}) {
+func (kws *WebsocketWrapper) SetAttribute(key string, attribute interface{}) {
 	kws.mu.Lock()
 	defer kws.mu.Unlock()
 	kws.attributes[key] = attribute
 }
 
 // GetAttribute Get a specific attribute from the socket attributes
-func (kws *Websocket) GetAttribute(key string) interface{} {
+func (kws *WebsocketWrapper) GetAttribute(key string) interface{} {
 	kws.mu.RLock()
 	defer kws.mu.RUnlock()
 	value, ok := kws.attributes[key]
@@ -306,7 +312,7 @@ func (kws *Websocket) GetAttribute(key string) interface{} {
 
 // GetIntAttribute Convenience method to retrieve an attribute as an int.
 // Will panic if attribute is not an int.
-func (kws *Websocket) GetIntAttribute(key string) int {
+func (kws *WebsocketWrapper) GetIntAttribute(key string) int {
 	kws.mu.RLock()
 	defer kws.mu.RUnlock()
 	value, ok := kws.attributes[key]
@@ -317,7 +323,7 @@ func (kws *Websocket) GetIntAttribute(key string) int {
 }
 
 // GetStringAttribute Convenience method to retrieve an attribute as a string.
-func (kws *Websocket) GetStringAttribute(key string) string {
+func (kws *WebsocketWrapper) GetStringAttribute(key string) string {
 	kws.mu.RLock()
 	defer kws.mu.RUnlock()
 	value, ok := kws.attributes[key]
@@ -328,7 +334,7 @@ func (kws *Websocket) GetStringAttribute(key string) string {
 }
 
 // EmitToList Emit the message to a specific socket uuids list
-func (kws *Websocket) EmitToList(uuids []string, message []byte, mType ...int) {
+func (kws *WebsocketWrapper) EmitToList(uuids []string, message []byte, mType ...int) {
 	for _, wsUUID := range uuids {
 		err := kws.EmitTo(wsUUID, message, mType...)
 		if err != nil {
@@ -338,7 +344,7 @@ func (kws *Websocket) EmitToList(uuids []string, message []byte, mType ...int) {
 }
 
 // EmitTo Emit to a specific socket connection
-func (kws *Websocket) EmitTo(uuid string, message []byte, mType ...int) error {
+func (kws *WebsocketWrapper) EmitTo(uuid string, message []byte, mType ...int) error {
 
 	conn, err := kws.manager.pool.get(uuid)
 	if err != nil {
@@ -355,7 +361,11 @@ func (kws *Websocket) EmitTo(uuid string, message []byte, mType ...int) error {
 
 // Broadcast to all the active connections
 // except avoid broadcasting the message to itself
-func (kws *Websocket) Broadcast(message []byte, except bool, mType ...int) {
+func (kws *WebsocketWrapper) Broadcast(message []byte, except bool, mType ...int) {
+	// 特殊判断：若是客户端，except能且只能是false
+	if kws.manager.ClientFlag {
+		except = false
+	}
 	for wsUUID := range kws.manager.pool.all() {
 		if except && kws.UUID == wsUUID {
 			continue
@@ -368,12 +378,12 @@ func (kws *Websocket) Broadcast(message []byte, except bool, mType ...int) {
 }
 
 // Fire custom event
-func (kws *Websocket) Fire(event string, data []byte) {
+func (kws *WebsocketWrapper) Fire(event string, data []byte) {
 	kws.fireEvent(event, data, nil)
 }
 
 // Emit /Write the message into the given connection
-func (kws *Websocket) Emit(message []byte, mType ...int) {
+func (kws *WebsocketWrapper) Emit(message []byte, mType ...int) {
 	t := TextMessage
 	if len(mType) > 0 {
 		t = mType[0]
@@ -382,38 +392,38 @@ func (kws *Websocket) Emit(message []byte, mType ...int) {
 }
 
 // Close Actively close the connection from the server
-func (kws *Websocket) Close() {
+func (kws *WebsocketWrapper) Close() {
 	kws.write(CloseMessage, []byte("Connection closed"))
 	kws.fireEvent(EventClose, nil, nil)
 }
 
-func (kws *Websocket) IsAlive() bool {
+func (kws *WebsocketWrapper) IsAlive() bool {
 	kws.mu.RLock()
 	defer kws.mu.RUnlock()
 	return kws.isAlive
 }
 
-func (kws *Websocket) hasConn() bool {
+func (kws *WebsocketWrapper) hasConn() bool {
 	kws.mu.RLock()
 	defer kws.mu.RUnlock()
 	return kws.Conn != nil
 }
 
-func (kws *Websocket) setAlive(alive bool) {
+func (kws *WebsocketWrapper) setAlive(alive bool) {
 	kws.mu.Lock()
 	defer kws.mu.Unlock()
 	kws.isAlive = alive
 }
 
 //nolint:all
-func (kws *Websocket) queueLength() int {
+func (kws *WebsocketWrapper) queueLength() int {
 	kws.mu.RLock()
 	defer kws.mu.RUnlock()
 	return len(kws.queue)
 }
 
 // pong writes a control message to the client
-func (kws *Websocket) pong(ctx context.Context) {
+func (kws *WebsocketWrapper) pong(ctx context.Context) {
 	timeoutTicker := time.NewTicker(PongTimeout)
 	defer timeoutTicker.Stop()
 	for {
@@ -427,7 +437,7 @@ func (kws *Websocket) pong(ctx context.Context) {
 }
 
 // Add in message queue
-func (kws *Websocket) write(messageType int, messageBytes []byte) {
+func (kws *WebsocketWrapper) write(messageType int, messageBytes []byte) {
 	kws.queue <- message{
 		mType:   messageType,
 		data:    messageBytes,
@@ -436,7 +446,7 @@ func (kws *Websocket) write(messageType int, messageBytes []byte) {
 }
 
 // Send out message queue
-func (kws *Websocket) send(ctx context.Context) {
+func (kws *WebsocketWrapper) send(ctx context.Context) {
 	for {
 		select {
 		case rawMessage := <-kws.queue:
@@ -468,7 +478,7 @@ func (kws *Websocket) send(ctx context.Context) {
 // Start Pong/Read/Write functions
 //
 // Needs to be blocking, otherwise the connection would close.
-func (kws *Websocket) run() {
+func (kws *WebsocketWrapper) run() {
 	ctx, cancelFunc := context.WithCancel(context.Background())
 
 	go kws.pong(ctx)
@@ -482,7 +492,7 @@ func (kws *Websocket) run() {
 
 // Listen for incoming messages
 // and filter by message type
-func (kws *Websocket) read(ctx context.Context) {
+func (kws *WebsocketWrapper) read(ctx context.Context) {
 	timeoutTicker := time.NewTicker(ReadTimeout)
 	defer timeoutTicker.Stop()
 	for {
@@ -495,7 +505,8 @@ func (kws *Websocket) read(ctx context.Context) {
 			kws.mu.RLock()
 			mType, msg, err := kws.Conn.ReadMessage()
 			kws.mu.RUnlock()
-
+			// 根据不同信息类型，发送对应的数据
+			// 收到PING和PONG信息时
 			if mType == PingMessage {
 				kws.fireEvent(EventPing, nil, nil)
 				continue
@@ -505,12 +516,12 @@ func (kws *Websocket) read(ctx context.Context) {
 				kws.fireEvent(EventPong, nil, nil)
 				continue
 			}
-
+			// 收到关闭消息时
 			if mType == CloseMessage {
 				kws.disconnected(nil)
 				return
 			}
-
+			// 读取消息错误的时候断开连接
 			if err != nil {
 				kws.disconnected(err)
 				return
@@ -525,7 +536,8 @@ func (kws *Websocket) read(ctx context.Context) {
 }
 
 // When the connection closes, disconnected method
-func (kws *Websocket) disconnected(err error) {
+func (kws *WebsocketWrapper) disconnected(err error) {
+	// 我们要在这里考虑判断逻辑，然后重新连接（若需要）
 	kws.fireEvent(EventDisconnect, nil, err)
 
 	// may be called multiple times from different go routines
@@ -547,12 +559,12 @@ func (kws *Websocket) disconnected(err error) {
 }
 
 // Create random UUID for each connection
-func (kws *Websocket) createUUID() string {
+func (kws *WebsocketWrapper) createUUID() string {
 	return kws.randomUUID()
 }
 
 // Generate random UUID.
-func (kws *Websocket) randomUUID() string {
+func (kws *WebsocketWrapper) randomUUID() string {
 	return uuid.New().String()
 }
 
@@ -562,7 +574,7 @@ func (kws *Websocket) randomUUID() string {
 //	event - 事件名称，用于识别要触发的事件。
 //	data - 事件数据，以字节切片形式传递给回调函数。
 //	error - 事件错误，传递给回调函数的错误信息（如果有）。
-func (kws *Websocket) fireEvent(event string, data []byte, error error) {
+func (kws *WebsocketWrapper) fireEvent(event string, data []byte, error error) {
 	// 获取指定事件的所有回调函数。
 	callbacks := kws.manager.listeners.get(event)
 

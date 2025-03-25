@@ -58,10 +58,10 @@ func echo(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 
-	handler := instance.New(func(kws *socketio.Websocket) {
-		//Broadcast to all the connected users the newcomer
+	handler := instance.New(func(kws *socketio.WebsocketWrapper) {
+		// Broadcast to all the connected users the newcomer
 		kws.Broadcast([]byte(fmt.Sprintf("New user connected:  and UUID: %s", kws.UUID)), true, socketio.TextMessage)
-		//Write welcome message
+		// Write welcome message
 		kws.Emit([]byte(fmt.Sprintf("Hello user:  with UUID: %s", kws.UUID)), socketio.TextMessage)
 	}, c)
 	handler(w, r)
