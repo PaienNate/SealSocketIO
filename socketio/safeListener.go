@@ -1,6 +1,6 @@
 package socketio
 
-import "websocket/socketio/util"
+import "github.com/PaienNate/SealSocketIO/socketio/util"
 
 // safeListeners 是一个线程安全的事件监听器集合
 type safeListeners struct {

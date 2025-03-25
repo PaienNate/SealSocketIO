@@ -3,10 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/PaienNate/SealSocketIO/socketio"
 	"github.com/gorilla/websocket"
 	"log"
 	"net/http"
-	"websocket/socketio"
 )
 
 var upgrader = websocket.Upgrader{} // use default options

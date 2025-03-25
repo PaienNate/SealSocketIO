@@ -1,6 +1,6 @@
 package socketio
 
-import "websocket/socketio/util"
+import "github.com/PaienNate/SealSocketIO/socketio/util"
 
 // 简易安全的池子
 

@@ -1,4 +1,4 @@
-module websocket
+module github.com/PaienNate/SealSocketIO
 
 go 1.22
 
