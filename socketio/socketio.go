@@ -2,10 +2,12 @@ package socketio
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 )
@@ -82,7 +84,7 @@ type message struct {
 type WebsocketWrapper struct {
 	once sync.Once
 	mu   sync.RWMutex
-	// Change to websocket raw
+	// websocket raw
 	Conn *websocket.Conn
 	// Define if the connection is alive or not
 	isAlive bool
@@ -97,6 +99,22 @@ type WebsocketWrapper struct {
 	UUID string
 	// Manager
 	manager *SocketInstance
+	// ClientMode Needed
+	WebsocketDialer   *websocket.Dialer
+	Url               string
+	ConnectionOptions ConnectionOptions
+	RequestHeader     http.Header
+	ClientFlag        bool
+}
+
+// ConnectionOptions Copied from gowebsocket.
+type ConnectionOptions struct {
+	UseCompression bool
+	UseSSL         bool
+	Proxy          func(*http.Request) (*url.URL, error)
+	Subprotocols   []string
+	// 过期时间 TODO: 存疑是否可以使用
+	Timeout time.Duration
 }
 
 // EventPayload Event Payload is the object that
@@ -218,6 +236,7 @@ func fakeNewWrapper(handler func(conn *websocket.Conn), conn *websocket.Conn) ht
 }
 
 func (sm *SocketInstance) New(callback func(kws *WebsocketWrapper), conn *websocket.Conn) http.HandlerFunc {
+	// 这个函数不报错的原因是因为conn部分已经被初始化过了
 	tempFunction := func(c *websocket.Conn) {
 		kws := &WebsocketWrapper{
 			Conn:       c,
@@ -245,34 +264,63 @@ func (sm *SocketInstance) New(callback func(kws *WebsocketWrapper), conn *websoc
 	return fakeNewWrapper(tempFunction, conn)
 }
 
-// NewClient 只需要我们直接执行对应的function
-func (sm *SocketInstance) NewClient(callback func(kws *WebsocketWrapper), conn *websocket.Conn) {
-	tempFunction := func(c *websocket.Conn) {
-		kws := &WebsocketWrapper{
-			Conn:       c,
-			queue:      make(chan message, 100),
-			done:       make(chan struct{}, 1),
-			attributes: make(map[string]interface{}),
-			isAlive:    true,
-			manager:    sm,
+func (socket *WebsocketWrapper) setConnectionOptions() {
+	socket.WebsocketDialer.EnableCompression = socket.ConnectionOptions.UseCompression
+	socket.WebsocketDialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: socket.ConnectionOptions.UseSSL}
+	socket.WebsocketDialer.Proxy = socket.ConnectionOptions.Proxy
+	socket.WebsocketDialer.Subprotocols = socket.ConnectionOptions.Subprotocols
+}
+func (socket *WebsocketWrapper) Connect() error {
+	var err error
+	var resp *http.Response
+	socket.setConnectionOptions()
+
+	socket.Conn, resp, err = socket.WebsocketDialer.Dial(socket.Url, socket.RequestHeader)
+
+	if err != nil {
+		// logger.Error.Println("Error while connecting to server ", err)
+		if resp != nil {
+			// logger.Error.Println("HTTP Response %d status: %s", resp.StatusCode, resp.Status)
 		}
-
-		// Generate uuid
-		kws.UUID = kws.createUUID()
-
-		// register the connection into the pool
-		sm.pool.set(kws)
-
-		// execute the callback of the socket initialization
-		callback(kws)
-
-		kws.fireEvent(EventConnect, nil, nil)
-
-		// Run the loop for the given connection
-		kws.run()
+		return err
 	}
-	sm.ClientFlag = true
-	tempFunction(conn)
+	// 设置ClientFlag = true
+	socket.ClientFlag = true
+	// logger.Info.Println("Connected to server")
+	return nil
+}
+
+// NewClient
+func (sm *SocketInstance) NewClient(callback func(kws *WebsocketWrapper), url string, options ConnectionOptions) error {
+	// 通过类似 gowebsocket 的初始化方式进行初始化
+	kws := &WebsocketWrapper{
+		queue:             make(chan message, 100),
+		done:              make(chan struct{}, 1),
+		attributes:        make(map[string]interface{}),
+		isAlive:           true,
+		manager:           sm,
+		ConnectionOptions: options,
+		Url:               url,
+	}
+	err := kws.Connect()
+	if err != nil {
+		return err
+	}
+	// Generate uuid
+	kws.UUID = kws.createUUID()
+
+	// register the connection into the pool
+	sm.pool.set(kws)
+
+	// execute the callback of the socket initialization
+	callback(kws)
+
+	kws.fireEvent(EventConnect, nil, nil)
+
+	// Run the loop for the given connection
+	kws.run()
+	// TODO: 实际上上面的代码会阻塞，所以这里永远不会执行……怎么处理一下好呢……
+	return nil
 }
 
 func (kws *WebsocketWrapper) GetUUID() string {
